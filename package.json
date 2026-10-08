@@ -1,0 +1,21 @@
+{
+  "name": "calcom-mailerlite-webhook",
+  "version": "1.0.0",
+  "description": "Auto-tag Cal.com bookings in MailerLite",
+  "main": "api/webhook.js",
+  "engines": {
+    "node": "18"
+  },
+  "scripts": {
+    "dev": "node --loader ./dev-server.js",
+    "test": "echo \"See WEBHOOK-DEPLOYMENT-GUIDE.md for testing instructions\""
+  },
+  "keywords": [
+    "cal.com",
+    "mailerlite",
+    "webhook",
+    "automation"
+  ],
+  "author": "Spencer Life Agency",
+  "license": "MIT"
+}
