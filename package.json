@@ -4,7 +4,7 @@
   "description": "Auto-tag Cal.com bookings in MailerLite",
   "main": "api/webhook.js",
   "engines": {
-    "node": "18"
+    "node": "24"
   },
   "scripts": {
     "dev": "node --loader ./dev-server.js",
