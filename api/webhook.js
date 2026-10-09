@@ -1,147 +1,80 @@
-/**
- * Cal.com → MailerLite Auto-Tagger
- * 
- * Deployed as Vercel serverless function at:
- * https://your-vercel-domain.vercel.app/api/calcom-webhook
- * 
- * Triggers on Cal.com BOOKING_CREATED event
- * Automatically adds subscriber to MailerLite "Booked Call" group
- */
+import { createHmac, timingSafeEqual } from 'node:crypto';
 
-const crypto = require('crypto');
+// Authenticate original bytes, never a re-serialized object.
+export const config = { api: { bodyParser: false } };
+const MAX_BODY_BYTES = 256 * 1024;
+// Verified existing Family Protection Review; new event types require review.
+const WEBSITE_EVENT_IDS = new Set([6935176]);
 
 export default async function handler(req, res) {
-  // Only accept POST
   if (req.method !== 'POST') {
+    res.setHeader('Allow', 'POST');
     return res.status(405).json({ error: 'Method not allowed' });
   }
-
+  const secret = process.env.CALCOM_WEBHOOK_SECRET;
+  if (!secret) return res.status(500).json({ error: 'Server configuration error' });
+  const signature = req.headers['x-cal-signature-256'];
+  if (typeof signature !== 'string' || !/^[a-f0-9]{64}$/i.test(signature)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  let raw;
   try {
-    // 1. VERIFY WEBHOOK SIGNATURE
-    const signature = req.headers['x-cal-signature-256'];
-    const secret = process.env.CALCOM_WEBHOOK_SECRET;
-
-    if (!secret) {
-      console.error('Missing CALCOM_WEBHOOK_SECRET');
-      return res.status(500).json({ error: 'Server configuration error' });
+    const chunks = [];
+    let size = 0;
+    for await (const chunk of req) {
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+      size += bytes.length;
+      if (size > MAX_BODY_BYTES) return res.status(413).json({ error: 'Payload too large' });
+      chunks.push(bytes);
     }
-
-    // ⚠️ CRITICAL: Use raw body for signature verification
-    // req.body is already parsed; we need the original JSON string
-    // For Vercel, get the raw body from req.rawBody (set by vercel middleware)
-    // or stringify the parsed body for HMAC calculation
-    let body;
-    if (req.rawBody) {
-      body = req.rawBody;
-    } else if (Buffer.isBuffer(req.body)) {
-      body = req.body.toString('utf8');
-    } else {
-      // Fallback: stringify the parsed body (may cause signature mismatch if formatting differs)
-      body = JSON.stringify(req.body);
-    }
-
-    const expectedSignature = crypto
-      .createHmac('sha256', secret)
-      .update(body)
-      .digest('hex');
-
-    console.log('Signature verification:', {
-      received: signature,
-      expected: expectedSignature,
-      match: signature === expectedSignature,
-      bodyLength: body.length,
-    });
-
-    // Temporarily allow unsigned requests for debugging
-    if (signature && signature !== expectedSignature) {
-      console.warn('Invalid webhook signature (signature provided but mismatched)', { 
-        signature: signature.substring(0, 20) + '...', 
-        expectedSignature: expectedSignature.substring(0, 20) + '...',
-      });
-      // Temporarily allowing to proceed for testing
-      // In production, this should return 401
-      // return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    // 2. EXTRACT BOOKING DATA FROM CAL.COM PAYLOAD
-    const event = req.body;
-
-    // Verify it's a booking creation event
-    if (event.triggerEvent !== 'BOOKING_CREATED') {
-      console.log('Ignoring non-booking event:', event.triggerEvent);
-      return res.status(200).json({ message: 'Event ignored' });
-    }
-
-    // Extract attendee info (the person who booked) - try attendees array first, then guest field
-    const attendee = event.attendees?.[0] || event.guest;
-    if (!attendee || !attendee.email) {
-      console.error('No attendee email found in webhook payload');
-      return res.status(400).json({ error: 'Missing attendee email' });
-    }
-
-    const email = attendee.email;
-    const name = attendee.name || email.split('@')[0];
-    const eventTypeSlug = event.type; // e.g., "family-protection-review-with-keith" or "family-protection-review-w-keith"
-
-    console.log(`Booking created: ${name} (${email}) - Event: ${eventTypeSlug}`);
-
-    // 3. CALL MAILERLITE API TO ADD SUBSCRIBER TO "BOOKED CALL" GROUP
-    const mailerliteApiKey = process.env.MAILERLITE_API_KEY;
-    const mailerliteGroupId = process.env.MAILERLITE_BOOKED_CALL_GROUP_ID;
-
-    if (!mailerliteApiKey || !mailerliteGroupId) {
-      console.error('Missing MailerLite configuration');
-      return res.status(500).json({ error: 'Server configuration error' });
-    }
-
-    // First, find or create the subscriber in MailerLite
-    const subscriberResponse = await fetch('https://connect.mailerlite.com/api/subscribers', {
+    raw = Buffer.concat(chunks);
+  } catch {
+    return res.status(400).json({ error: 'Unable to read request' });
+  }
+  const expected = createHmac('sha256', secret).update(raw).digest();
+  if (!timingSafeEqual(Buffer.from(signature, 'hex'), expected)) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
+  let event;
+  try { event = JSON.parse(raw.toString('utf8')); }
+  catch { return res.status(400).json({ error: 'Invalid JSON' }); }
+  if (!event || typeof event !== 'object' || Array.isArray(event)) {
+    return res.status(400).json({ error: 'Invalid event' });
+  }
+  if (event.triggerEvent !== 'BOOKING_CREATED') {
+    return res.status(200).json({ message: 'Event ignored' });
+  }
+  // Standard Cal.com BOOKING_CREATED wraps booking data in payload.
+  // No slug/flat fallback: missing and unknown IDs fail closed.
+  const booking = event.payload;
+  if (!booking || !Number.isSafeInteger(booking.eventTypeId) ||
+      !WEBSITE_EVENT_IDS.has(booking.eventTypeId)) {
+    return res.status(200).json({ message: 'Event type ignored' });
+  }
+  const attendee = Array.isArray(booking.attendees) ? booking.attendees[0] : null;
+  if (!attendee || typeof attendee.email !== 'string' ||
+      !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(attendee.email) || attendee.email.length > 254) {
+    return res.status(400).json({ error: 'Missing or invalid attendee email' });
+  }
+  const key = process.env.MAILERLITE_API_KEY;
+  const group = process.env.MAILERLITE_BOOKED_CALL_GROUP_ID;
+  if (!key || !group) return res.status(500).json({ error: 'Server configuration error' });
+  try {
+    // Preserve the existing group; never forward notes or health details.
+    const response = await fetch('https://connect.mailerlite.com/api/subscribers', {
       method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${mailerliteApiKey}`,
-        'Content-Type': 'application/json',
-      },
+      headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        email: email,
-        fields: {
-          name: name,
-        },
-        groups: [mailerliteGroupId],
+        email: attendee.email,
+        fields: { name: typeof attendee.name === 'string' ? attendee.name : attendee.email.split('@')[0] },
+        groups: [group],
       }),
+      signal: AbortSignal.timeout(10000),
     });
-
-    if (!subscriberResponse.ok) {
-      const errorData = await subscriberResponse.text();
-      console.error('MailerLite API error', {
-        status: subscriberResponse.status,
-        error: errorData,
-      });
-      return res.status(500).json({ 
-        error: 'Failed to add subscriber to MailerLite',
-        details: errorData,
-      });
-    }
-
-    const subscriberData = await subscriberResponse.json();
-    console.log(`✓ Added ${email} to Booked Call group`, {
-      subscriberId: subscriberData.data?.id,
-      email: email,
-    });
-
-    // 4. RETURN SUCCESS
-    return res.status(200).json({
-      success: true,
-      message: `${email} tagged in Booked Call`,
-      subscriberId: subscriberData.data?.id,
-      email: email,
-      eventType: eventTypeSlug,
-    });
-
-  } catch (error) {
-    console.error('Webhook handler error:', error.message);
-    return res.status(500).json({ 
-      error: 'Internal server error',
-      message: error.message,
-    });
+    if (!response.ok) return res.status(502).json({ error: 'Subscriber update failed' });
+    return res.status(200).json({ success: true });
+  } catch {
+    // No subscriber data, tokens, signatures or upstream errors in logs/responses.
+    return res.status(502).json({ error: 'Subscriber update failed' });
   }
 }
