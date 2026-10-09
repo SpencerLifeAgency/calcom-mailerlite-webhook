@@ -14,10 +14,12 @@ const fixture = (id = 6935176) => ({ triggerEvent: 'BOOKING_CREATED', payload: {
 } });
 async function run(event = fixture(), options = {}) {
   const calls = [];
+  const logs = [];
   const raw = options.raw ?? JSON.stringify(event, null, 2);
   const env = { CALCOM_WEBHOOK_SECRET: 'test-only-secret', MAILERLITE_API_KEY: 'fake-key',
     MAILERLITE_BOOKED_CALL_GROUP_ID: 'existing-group', ...options.env };
   const context = vm.createContext({ createHmac, timingSafeEqual, Buffer, AbortSignal,
+    console: { info: (...args) => logs.push(args) },
     process: { env }, fetch: async (...args) => {
       calls.push(args);
       if (options.networkError) throw new Error('PRIVATE UPSTREAM DATA');
@@ -31,7 +33,7 @@ async function run(event = fixture(), options = {}) {
   const res = { code: 0, headers: {}, setHeader(k,v) { this.headers[k]=v; },
     status(code) { this.code=code; return this; }, json(body) { this.body=body; return this; } };
   await context.handler(req, res);
-  return { code: res.code, body: JSON.parse(JSON.stringify(res.body)), calls };
+  return { code: res.code, body: JSON.parse(JSON.stringify(res.body)), calls, logs };
 }
 test('approved website booking preserves group; uses nested payload and exact raw bytes', async () => {
   const result = await run();
@@ -41,6 +43,19 @@ test('approved website booking preserves group; uses nested payload and exact ra
   assert.deepEqual(JSON.parse(result.calls[0][1].body), {
     email: 'test@example.com', fields: { name: 'Test' }, groups: ['existing-group'],
   });
+});
+test('outcome logs distinguish success, ignores and failures without customer data', async () => {
+  for (const [event, options, outcome] of [
+    [fixture(), {}, 'subscriber_updated'],
+    [fixture(7388814), {}, 'event_type_ignored'],
+    [{...fixture(), triggerEvent:'BOOKING_CANCELLED'}, {}, 'trigger_ignored'],
+    [fixture(), {upstreamOk:false}, 'subscriber_update_failed'],
+    [fixture(), {networkError:true}, 'subscriber_update_failed'],
+  ]) {
+    const r = await run(event, options);
+    assert.deepEqual(r.logs, [['webhook_outcome: '+outcome]]);
+  }
+  assert.deepEqual((await run(fixture(),{signature:null})).logs, []);
 });
 for (const id of [7388814, 123, undefined, null, '6935176']) {
   test(`ignores unapproved event ID ${id}`, async () => {

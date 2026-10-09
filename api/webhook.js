@@ -42,6 +42,7 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Invalid event' });
   }
   if (event.triggerEvent !== 'BOOKING_CREATED') {
+    console.info('webhook_outcome: trigger_ignored');
     return res.status(200).json({ message: 'Event ignored' });
   }
   // Standard Cal.com BOOKING_CREATED wraps booking data in payload.
@@ -49,6 +50,7 @@ export default async function handler(req, res) {
   const booking = event.payload;
   if (!booking || !Number.isSafeInteger(booking.eventTypeId) ||
       !WEBSITE_EVENT_IDS.has(booking.eventTypeId)) {
+    console.info('webhook_outcome: event_type_ignored');
     return res.status(200).json({ message: 'Event type ignored' });
   }
   const attendee = Array.isArray(booking.attendees) ? booking.attendees[0] : null;
@@ -71,9 +73,14 @@ export default async function handler(req, res) {
       }),
       signal: AbortSignal.timeout(10000),
     });
-    if (!response.ok) return res.status(502).json({ error: 'Subscriber update failed' });
+    if (!response.ok) {
+      console.info('webhook_outcome: subscriber_update_failed');
+      return res.status(502).json({ error: 'Subscriber update failed' });
+    }
+    console.info('webhook_outcome: subscriber_updated');
     return res.status(200).json({ success: true });
   } catch {
+    console.info('webhook_outcome: subscriber_update_failed');
     // No subscriber data, tokens, signatures or upstream errors in logs/responses.
     return res.status(502).json({ error: 'Subscriber update failed' });
   }
